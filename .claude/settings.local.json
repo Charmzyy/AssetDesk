@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:developer.atlassian.com)",
+      "Bash(npx forge *)",
+      "Bash(npm install *)",
+      "Bash(npx eslint *)",
+      "Bash(node -e ' *)"
+    ]
+  }
+}

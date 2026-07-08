@@ -1,0 +1,106 @@
+
+
+
+modules:
+  jira:adminPage:
+    - key: admin-page-assetdesk-configure-page
+      resource: main-configure-page
+      title: Configure
+      render: native
+      resolver:
+        function: resolver
+      useAsConfig: true
+
+    - key: admin-page-assetdesk-get-started-page
+      resource: main-get-started-page
+      title: Get started
+      render: native
+      resolver:
+        function: resolver
+      useAsGetStarted: true
+
+  jiraServiceManagement:portalFooter:
+    - key: assetdesk-portal-footer
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      viewportSize: xlarge
+      title: AssetDesk
+      unlicensedAccess:
+        - anonymous
+        - customer
+        - unlicensed
+
+  jira:issuePanel:
+    - key: assetdesk-csv-import-panel
+      resource: csv-import-panel
+      resolver:
+        function: resolver
+      render: native
+      title: Import Assets from CSV
+      icon: src/resources/csv-import-icon.svg
+
+  consumer:
+    - key: asset-load-job-consumer
+      queue: asset-load-queue
+      function: asset-load-consumer-fn
+    - key: csv-import-job-consumer
+      queue: csv-import-queue
+      function: csv-import-consumer-fn
+    - key: export-job-consumer
+      queue: export-queue
+      function: export-consumer-fn
+
+  function:
+    - key: resolver
+      handler: index.handler
+    - key: asset-load-consumer-fn
+      handler: assetLoadConsumer.handler
+      timeoutSeconds: 300
+    - key: csv-import-consumer-fn
+      handler: csvImportConsumer.handler
+      timeoutSeconds: 900
+    - key: export-consumer-fn
+      handler: exportJobConsumer.handler
+      timeoutSeconds: 600
+
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+  - key: main-configure-page
+    path: src/frontend/ConfigurePage.jsx
+  - key: main-get-started-page
+    path: src/frontend/GetStartedPage.jsx
+  - key: csv-import-panel
+    path: src/frontend/CsvImportPanel.jsx
+
+
+
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/7ca3f2bd-3d2b-4b9c-9b92-323808fd555c
+
+
+permissions:
+  scopes:
+    - read:jira-user
+    - read:jira-work
+    - manage:jira-configuration
+    - manage:servicedesk-customer
+    - read:servicedesk-request
+    - storage:app
+    - read:cmdb-object:jira
+    - write:cmdb-object:jira
+    - read:cmdb-schema:jira
+    - read:cmdb-config:jira
+    - read:cmdb-attribute:jira
+    - read:cmdb-type:jira
+    - read:attachment:jira
+    # - read:assets:jira-service-management
+    # - write:assets:jira-service-management
+    # - read:status:jira-service-management
+  
