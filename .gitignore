@@ -49,7 +49,7 @@ Thumbs.db
 *.wmv
 
 # Documentation
-docs/*
+docs/pdf/*
 
 
 /.forge/

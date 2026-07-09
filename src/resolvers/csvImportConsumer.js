@@ -1,5 +1,7 @@
 import { kvs } from '@forge/kvs';
 import api, { route } from '@forge/api';
+import * as XLSX from 'xlsx';
+import { advanceImportPlan } from './importPostFunctions';
 import {
   CONFIG_KEY,
   csvImportJobKey,
@@ -107,7 +109,10 @@ const buildAttributesPayload = async ({ matched, row, workspaceId, schemaId, row
 };
 
 export const handler = async (event) => {
-  const { jobId, attachmentId, objectTypeId, createOnly } = event.body || {};
+  // sheetName/filename/plan are only present on plan-chained jobs from
+  // importPostFunctions.js (or the panel's plan confirm); the original
+  // single-CSV panel flow sends neither and behaves exactly as before.
+  const { jobId, attachmentId, objectTypeId, createOnly, sheetName, filename, plan: planRef } = event.body || {};
 
   if (!jobId) {
     console.error('[csvImportConsumer] event missing jobId — cannot report a result anywhere', event);
@@ -143,10 +148,30 @@ export const handler = async (event) => {
     }
   };
 
+  // Terminal-state writer — every done/error exit goes through here so a
+  // plan-chained job (planRef present) also advances its import plan:
+  // record this unit's outcome, enqueue the next sheet, or finalize the
+  // plan and post the summary comment (see importPostFunctions.js). Plan
+  // bookkeeping failures are logged but never clobber the job's own
+  // result record, which is already written by then.
+  const finalizeJob = async (record) => {
+    await kvs.set(csvImportJobKey(jobId), record);
+    if (!planRef) return;
+    try {
+      await advanceImportPlan({
+        issueId: planRef.issueId,
+        unitIndex: planRef.unitIndex,
+        outcome: { summary: record.summary, error: record.error },
+      });
+    } catch (err) {
+      console.error(`[csvImportConsumer] jobId=${jobId} failed to advance the import plan:`, err);
+    }
+  };
+
   try {
     const config = (await kvs.get(CONFIG_KEY)) || {};
     if (!config.schemaId) {
-      await kvs.set(csvImportJobKey(jobId), {
+      await finalizeJob({
         status: 'done', total: 0, processed: 0, summary, errors, errorsTruncated, warnings, warningsTruncated,
         error: 'No Assets schema configured.',
       });
@@ -156,13 +181,34 @@ export const handler = async (event) => {
     const caller = api.asApp();
     const contentRes = await caller.requestJira(route`/rest/api/3/attachment/content/${attachmentId}`);
     if (!contentRes.ok) {
-      await kvs.set(csvImportJobKey(jobId), {
+      await finalizeJob({
         status: 'done', total: 0, processed: 0, summary, errors, errorsTruncated, warnings, warningsTruncated,
         error: `Could not download the attachment: ${contentRes.status}`,
       });
       return;
     }
-    const csvText = await contentRes.text();
+    // XLSX attachments are binary — .text() would mangle them, so download
+    // as a buffer either way. A bare CSV is just the buffer as UTF-8; an
+    // XLSX sheet becomes CSV text via sheet_to_csv, so everything
+    // downstream (parseCsvRows, header matching, the first-column
+    // unique-key convention) is identical to the original single-CSV path.
+    const buffer = Buffer.from(await contentRes.arrayBuffer());
+    let csvText;
+    if (sheetName != null || /\.xlsx$/i.test(filename || '')) {
+      const workbook = XLSX.read(buffer, { type: 'buffer' });
+      const targetSheet = sheetName != null ? sheetName : workbook.SheetNames[0];
+      const sheet = workbook.Sheets[targetSheet];
+      if (!sheet) {
+        await finalizeJob({
+          status: 'done', total: 0, processed: 0, summary, errors, errorsTruncated, warnings, warningsTruncated,
+          error: `Sheet "${targetSheet}" no longer exists in "${filename || 'the attachment'}" — was the file replaced after it was analyzed? Re-run the analyze step.`,
+        });
+        return;
+      }
+      csvText = XLSX.utils.sheet_to_csv(sheet);
+    } else {
+      csvText = buffer.toString('utf8');
+    }
     const { headers, rows } = parseCsvRows(csvText);
 
     const workspaceId = await getWorkspaceId(true);
@@ -175,7 +221,7 @@ export const handler = async (event) => {
     const uniqueKeyHeader = headers[0];
     const uniqueKeyMatch = matched.find((m) => m.header === uniqueKeyHeader);
     if (!uniqueKeyMatch) {
-      await kvs.set(csvImportJobKey(jobId), {
+      await finalizeJob({
         status: 'done', total: rows.length, processed: 0, summary, errors, errorsTruncated, warnings, warningsTruncated,
         error: `The first column "${uniqueKeyHeader}" doesn't match an attribute on this object type — nothing was imported.`,
       });
@@ -184,7 +230,7 @@ export const handler = async (event) => {
     const uniqueKeyAttributeName = uniqueKeyMatch.attribute.attributeName;
 
     console.log(
-      `[csvImportConsumer] jobId=${jobId} objectTypeId=${objectTypeId} totalRows=${rows.length} ` +
+      `[csvImportConsumer] jobId=${jobId} objectTypeId=${objectTypeId} sheet=${sheetName ?? '(csv)'} totalRows=${rows.length} ` +
       `matchedColumns=${matched.length}/${headers.length} uniqueKeyHeader="${uniqueKeyHeader}" (attribute="${uniqueKeyAttributeName}")`
     );
 
@@ -307,11 +353,11 @@ export const handler = async (event) => {
     }
 
     console.log(`[csvImportConsumer] jobId=${jobId} DONE`, summary);
-    await kvs.set(csvImportJobKey(jobId), { status: 'done', total: rows.length, processed: rows.length, summary, errors, errorsTruncated, warnings, warningsTruncated });
+    await finalizeJob({ status: 'done', total: rows.length, processed: rows.length, summary, errors, errorsTruncated, warnings, warningsTruncated });
   } catch (error) {
     console.error(`[csvImportConsumer] jobId=${jobId} job failed:`, error);
     try {
-      await kvs.set(csvImportJobKey(jobId), { status: 'error', error: error?.message || 'CSV import failed' });
+      await finalizeJob({ status: 'error', summary, error: error?.message || 'CSV import failed' });
     } catch (_) {
       // Frontend poll will eventually time out on its own if even this write fails.
     }

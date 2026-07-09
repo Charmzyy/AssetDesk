@@ -41,6 +41,22 @@ modules:
       title: Import Assets from CSV
       icon: src/resources/csv-import-icon.svg
 
+  # Two-step automated import (see src/resolvers/importPostFunctions.js):
+  # the admin places "Analyze" on the transition into an awaiting-approval
+  # status (it detects object types from the newest CSV/XLSX attachment's
+  # file/sheet names and posts the plan as a comment), and "Run" on the
+  # approve transition (it executes the saved plan). Whoever can execute
+  # the approve transition can import — confirmation is workflow-native.
+  jira:workflowPostFunction:
+    - key: assetdesk-import-analyze-postfunction
+      name: AssetDesk — Analyze asset import file
+      description: Detects Assets object types from the newest CSV/XLSX attachment and posts an import plan comment. Does not import anything.
+      function: import-analyze-fn
+    - key: assetdesk-import-approve-postfunction
+      name: AssetDesk — Run approved asset import
+      description: Runs the import plan previously posted by the Analyze post-function.
+      function: import-approve-fn
+
   consumer:
     - key: asset-load-job-consumer
       queue: asset-load-queue
@@ -64,6 +80,10 @@ modules:
     - key: export-consumer-fn
       handler: exportJobConsumer.handler
       timeoutSeconds: 600
+    - key: import-analyze-fn
+      handler: importPostFunctions.analyzeHandler
+    - key: import-approve-fn
+      handler: importPostFunctions.approveHandler
 
 resources:
   - key: main
@@ -89,6 +109,10 @@ permissions:
   scopes:
     - read:jira-user
     - read:jira-work
+    # write:jira-work is only for posting import plan/result COMMENTS from
+    # the automated import flow (importPostFunctions.js) — the comment is
+    # its sole feedback channel, nobody is watching the panel there.
+    - write:jira-work
     - manage:jira-configuration
     - manage:servicedesk-customer
     - read:servicedesk-request

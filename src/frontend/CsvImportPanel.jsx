@@ -38,6 +38,7 @@ const summaryBoxStyle = xcss({
 // asset-load job in src/frontend/index.jsx.
 
 const POLL_INTERVAL_MS = 1000;
+const PLAN_POLL_INTERVAL_MS = 1500;
 
 const App = () => {
   const [issueId, setIssueId] = useState(null);
@@ -69,6 +70,33 @@ const App = () => {
   const [job, setJob] = useState(null); // { status, total, processed, summary, errors, errorsTruncated, error }
   const jobPollTokenRef = useRef(0);
 
+  // ── Automated import plan state ──────────────────────────────────────────
+  // The plan is the per-issue record built by the analyze workflow
+  // post-function (or this panel's Analyze button) — see
+  // src/resolvers/importPostFunctions.js. The panel renders it with a
+  // per-unit object-type override Select (the escape hatch for units the
+  // file/sheet-name detector left unresolved) and a Confirm button that
+  // starts the same chained per-sheet import the approve post-function
+  // starts.
+  const [plan, setPlan] = useState(null);
+  const [planError, setPlanError] = useState(null);
+  const [planBusy, setPlanBusy] = useState(false);       // analyze in flight
+  const [planStarting, setPlanStarting] = useState(false); // confirm in flight
+  const [planCreateOnly, setPlanCreateOnly] = useState(false);
+  const planPollTokenRef = useRef(0);
+
+  const pollPlan = useCallback(async (currentIssueId, token) => {
+    // Same stale-poll token guard as pollJob below.
+    for (;;) {
+      if (planPollTokenRef.current !== token) return;
+      const result = await invoke('getImportPlan', { issueId: currentIssueId });
+      if (planPollTokenRef.current !== token) return;
+      if (result.plan) setPlan(result.plan);
+      if (!result.plan || result.plan.status !== 'importing') return;
+      await new Promise((resolve) => setTimeout(resolve, PLAN_POLL_INTERVAL_MS));
+    }
+  }, []);
+
   useEffect(() => {
     const init = async () => {
       try {
@@ -86,14 +114,23 @@ const App = () => {
           return;
         }
 
-        const [attachmentsResult, objectTypesResult] = await Promise.all([
+        const [attachmentsResult, objectTypesResult, planResult] = await Promise.all([
           invoke('getIssueCsvAttachments', { issueId: currentIssueId }),
           invoke('getObjectTypes', { schemaId: config.schemaId }),
+          invoke('getImportPlan', { issueId: currentIssueId }),
         ]);
 
         if (attachmentsResult.error) setLoadError(attachmentsResult.error);
         setAttachments(attachmentsResult.attachments || []);
         setObjectTypes(objectTypesResult.objectTypes || []);
+        if (planResult.plan) {
+          setPlan(planResult.plan);
+          // An import kicked off elsewhere (the approve post-function, or
+          // another agent's panel) may still be running — resume polling.
+          if (planResult.plan.status === 'importing') {
+            pollPlan(currentIssueId, ++planPollTokenRef.current);
+          }
+        }
       } catch (err) {
         setLoadError(err?.message || 'Failed to load this panel.');
       } finally {
@@ -161,6 +198,60 @@ const App = () => {
     }
   }, [issueId, selectedAttachmentId, selectedObjectTypeId, createOnly, preview, pollJob]);
 
+  const handleAnalyzePlan = useCallback(async () => {
+    setPlanBusy(true);
+    setPlanError(null);
+    try {
+      const result = await invoke('analyzeImportPlan', { issueId });
+      if (result.error) {
+        setPlanError(result.error);
+        if (result.plan) setPlan(result.plan);
+        return;
+      }
+      setPlan(result.plan);
+    } catch (err) {
+      setPlanError(err?.message || 'Failed to analyze the attachment.');
+    } finally {
+      setPlanBusy(false);
+    }
+  }, [issueId]);
+
+  const handleOverrideUnit = useCallback(async (unitIndex, opt) => {
+    if (!opt?.value) return;
+    setPlanError(null);
+    try {
+      const objectTypeName = objectTypes.find((t) => t.id === opt.value)?.name || '';
+      const result = await invoke('overrideImportPlanUnit', {
+        issueId, unitIndex, objectTypeId: opt.value, objectTypeName,
+      });
+      if (result.error) {
+        setPlanError(result.error);
+        return;
+      }
+      setPlan(result.plan);
+    } catch (err) {
+      setPlanError(err?.message || 'Failed to change the object type.');
+    }
+  }, [issueId, objectTypes]);
+
+  const handleConfirmPlan = useCallback(async () => {
+    setPlanStarting(true);
+    setPlanError(null);
+    try {
+      const result = await invoke('confirmImportPlan', { issueId, createOnly: planCreateOnly });
+      if (result.error) {
+        setPlanError(result.error);
+        return;
+      }
+      setPlan(result.plan);
+      pollPlan(issueId, ++planPollTokenRef.current);
+    } catch (err) {
+      setPlanError(err?.message || 'Failed to start the import.');
+    } finally {
+      setPlanStarting(false);
+    }
+  }, [issueId, planCreateOnly, pollPlan]);
+
   if (loading) {
     return (
       <Box xcss={panelStyle}>
@@ -183,11 +274,140 @@ const App = () => {
   }
 
   const jobInFlight = job && job.status !== 'done' && job.status !== 'error';
+  const planImporting = plan?.status === 'importing';
+  // uniqueKeyOk implies an objectTypeId is set — units the detector (or a
+  // manual override) resolved AND whose first column matched. `result` is
+  // ignored here on purpose: re-running a finished plan is allowed
+  // (startImportPlanJobs clears previous results).
+  const planRunnableCount = plan ? plan.units.filter((u) => u.objectTypeId && u.uniqueKeyOk).length : 0;
 
   return (
     <Box xcss={panelStyle}>
       <Stack space="space.200">
-        <Heading as="h4">Import Assets from CSV</Heading>
+        <Heading as="h4">Import Assets from CSV / Excel</Heading>
+
+        {/* ── Automated import plan ─────────────────────────────────────── */}
+        <Stack space="space.150">
+          <Heading as="h5">Automatic import plan</Heading>
+          <Text size="small" color="color.text.subtlest">
+            Detects each target object type from the newest CSV/XLSX attachment's file or sheet name —
+            e.g. "tv_stock.csv" imports into TV, and each sheet of a workbook imports into the type its name mentions.
+          </Text>
+
+          {planError && (
+            <SectionMessage appearance="error">
+              <Text>{planError}</Text>
+            </SectionMessage>
+          )}
+
+          {!plan && (
+            <Inline>
+              <Button onClick={handleAnalyzePlan} isLoading={planBusy} isDisabled={planBusy}>
+                Analyze newest attachment
+              </Button>
+            </Inline>
+          )}
+
+          {plan && (
+            <Stack space="space.150">
+              <Inline space="space.100" alignBlock="center">
+                {planImporting && <Spinner size="small" />}
+                <Text size="small" weight="medium">
+                  "{plan.filename}" — {plan.units.length} {plan.kind === 'xlsx' ? 'sheet(s)' : 'file'}
+                  {planImporting ? ' — importing…' : plan.status === 'done' ? ' — finished' : ''}
+                </Text>
+              </Inline>
+
+              {plan.units.map((unit) => (
+                <Box key={unit.index} xcss={summaryBoxStyle}>
+                  <Stack space="space.075">
+                    <Inline space="space.150" alignBlock="center" shouldWrap>
+                      <Text weight="medium">
+                        {unit.sheetName ? `Sheet "${unit.sheetName}"` : plan.filename}
+                      </Text>
+                      <Text size="small" color="color.text.subtlest">{unit.totalRows} row(s)</Text>
+                      <Box xcss={xcss({ minWidth: '220px' })}>
+                        <Select
+                          inputId={`plan-unit-type-${unit.index}`}
+                          placeholder="Select object type…"
+                          options={objectTypes.map((t) => ({ label: t.name, value: t.id }))}
+                          value={
+                            unit.objectTypeId
+                              ? {
+                                  label: unit.objectTypeName || objectTypes.find((t) => t.id === unit.objectTypeId)?.name || unit.objectTypeId,
+                                  value: unit.objectTypeId,
+                                }
+                              : null
+                          }
+                          onChange={(opt) => handleOverrideUnit(unit.index, opt)}
+                          isDisabled={planImporting || planBusy || planStarting}
+                        />
+                      </Box>
+                    </Inline>
+
+                    {unit.objectTypeId && (
+                      <Text size="small" color="color.text.subtlest">
+                        {unit.matchedBy === 'manual' ? 'Manually chosen' : `Detected from the ${unit.sheetName ? 'sheet' : 'file'} name`} —
+                        {' '}{unit.matchedColumns}/{unit.totalColumns} column(s) matched
+                        {unit.uniqueKeyOk ? ` — key column "${unit.uniqueKeyHeader}" OK` : ''}
+                      </Text>
+                    )}
+
+                    {unit.isParentType && (
+                      <Text size="small" color="color.text.warning">
+                        {unit.objectTypeName} is a parent type — if these objects belong in one of its child types, pick the child above before importing.
+                      </Text>
+                    )}
+
+                    {unit.reason && !unit.result && (
+                      <Text size="small" color="color.text.danger">{unit.reason}</Text>
+                    )}
+
+                    {unit.result && (
+                      unit.result.error ? (
+                        <Text size="small" color="color.text.danger">Failed: {unit.result.error}</Text>
+                      ) : (
+                        <Text size="small">
+                          Done — {unit.result.summary?.created || 0} created, {unit.result.summary?.updated || 0} updated,
+                          {' '}{unit.result.summary?.unchanged || 0} unchanged, {unit.result.summary?.failed || 0} failed
+                        </Text>
+                      )
+                    )}
+                  </Stack>
+                </Box>
+              ))}
+
+              <Inline space="space.100" alignBlock="center">
+                <Toggle
+                  id="plan-create-only-toggle"
+                  isChecked={planCreateOnly}
+                  onChange={() => setPlanCreateOnly((prev) => !prev)}
+                  isDisabled={planImporting || planStarting}
+                />
+                <Label labelFor="plan-create-only-toggle">
+                  Create only — treat an existing match as an error instead of updating it
+                </Label>
+              </Inline>
+
+              <Inline space="space.100">
+                <Button
+                  appearance="primary"
+                  onClick={handleConfirmPlan}
+                  isDisabled={planRunnableCount === 0 || planImporting || planBusy}
+                  isLoading={planStarting}
+                >
+                  {plan.status === 'done' ? 'Run again' : `Start import (${planRunnableCount} ready)`}
+                </Button>
+                <Button onClick={handleAnalyzePlan} isDisabled={planBusy || planImporting || planStarting} isLoading={planBusy}>
+                  Re-analyze
+                </Button>
+              </Inline>
+            </Stack>
+          )}
+        </Stack>
+
+        {/* ── Manual single-CSV import (original flow, unchanged) ────────── */}
+        <Heading as="h5">Manual single-CSV import</Heading>
 
         {attachments.length === 0 && (
           <SectionMessage appearance="info">

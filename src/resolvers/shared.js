@@ -20,6 +20,14 @@ export const jobKey = (jobId) => `asset-load-job:${jobId}`;
 // job — see src/resolvers/csvImport.js / csvImportConsumer.js.
 export const csvImportJobKey = (jobId) => `csv-import-job:${jobId}`;
 
+// Per-ISSUE (not per-job) key for the analyzed import PLAN — the
+// "which attachment, which sheets, which object types" record built by the
+// analyze workflow post-function (or the panel's Analyze button) and
+// consumed by the approve post-function / the panel's Confirm button. One
+// plan per issue: re-analyzing overwrites it. See
+// src/resolvers/importPostFunctions.js.
+export const importPlanKey = (issueId) => `csv-import-plan:${issueId}`;
+
 // Same pattern again, for XLSX/PDF export — see
 // src/resolvers/exportAssets.js / exportJobConsumer.js. Building a large
 // PDF (per-cell height measurement in pdfkit) or re-running the
@@ -635,6 +643,119 @@ export const fetchObjectTypeAttributeDefs = async (caller, workspaceId, objectTy
     console.error(`[fetchObjectTypeAttributeDefs] failed for objectType ${objectTypeId}:`, e);
     return [];
   }
+};
+
+// Lists a schema's object types INCLUDING hierarchy info — unlike the
+// getObjectTypes resolver in adminResolvers.js (which only surfaces
+// id/name for its picker), the import-plan detector also needs
+// parentObjectTypeId (to warn when a matched type is a parent whose
+// children hold the real objects) and abstractObjectType (abstract types
+// can never hold objects, so matching one must block the unit).
+export const fetchSchemaObjectTypes = async (caller, workspaceId, schemaId) => {
+  const res = await caller.requestJira(
+    route`/jsm/assets/workspace/${workspaceId}/v1/objectschema/${schemaId}/objecttypes?excludeAbstract=false`
+  );
+  if (!res.ok) {
+    throw new Error(`Could not list object types: ${res.status}`);
+  }
+  const data = await res.json();
+  const rawList = Array.isArray(data) ? data : data.entries || data.values || data.objectTypes || [];
+  return rawList
+    .map((t) => ({
+      id: String(t.id || t.objectTypeId || ''),
+      name: t.name || t.objectTypeName || '',
+      parentObjectTypeId: t.parentObjectTypeId != null ? String(t.parentObjectTypeId) : '',
+      abstract: Boolean(t.abstractObjectType),
+    }))
+    .filter((t) => t.id && t.name);
+};
+
+// ─── Filename / sheet-name → object type detection ────────────────────────────
+// The automated import flow (importPostFunctions.js) has no human picking
+// an object type, so the file/sheet NAME has to carry it — but loosely:
+// "tv_stock_july.csv" should hit the type "TV", a sheet "new laptops 2026"
+// should hit "Laptops". The rules that keep loose from becoming sloppy:
+//
+//   1. Token match, not raw substring — both sides are lowercased and
+//      split on non-alphanumerics, and the type's name must appear as a
+//      run of WHOLE tokens. Raw substring matching would let short type
+//      names (like "TV") fire inside unrelated words.
+//   2. Singular/plural tolerance — "laptop_list" matches "Laptops" and
+//      vice versa, via a trailing-'s' allowance per token.
+//   3. Longest match wins — "samsung tv stock" mentions both "Samsung TV"
+//      and "TV"; the more-token match takes it. This is also what makes
+//      child types outrank their parent whenever the child's fuller name
+//      is present.
+//   4. A tie between DIFFERENT types at the same length is AMBIGUOUS —
+//      never guess; the unit is left unresolved with the tied candidates
+//      reported, to be settled in the panel.
+
+export const tokenizeForTypeMatch = (s) =>
+  String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+// Trailing-'s' plural tolerance in both directions ("laptop"/"laptops").
+const typeTokensEqual = (a, b) => a === b || a === `${b}s` || `${a}s` === b;
+
+export const detectObjectTypeFromName = (rawName, objectTypes) => {
+  const nameTokens = tokenizeForTypeMatch(rawName);
+  const matches = [];
+
+  for (const type of objectTypes) {
+    const typeTokens = tokenizeForTypeMatch(type.name);
+    if (typeTokens.length === 0 || typeTokens.length > nameTokens.length) continue;
+    let found = false;
+    for (let i = 0; i + typeTokens.length <= nameTokens.length && !found; i++) {
+      let ok = true;
+      for (let j = 0; j < typeTokens.length; j++) {
+        if (!typeTokensEqual(nameTokens[i + j], typeTokens[j])) { ok = false; break; }
+      }
+      if (ok) found = true;
+    }
+    if (found) matches.push({ type, tokenCount: typeTokens.length });
+  }
+
+  if (matches.length === 0) return { match: null, candidates: [], ambiguous: false };
+
+  const maxTokens = Math.max(...matches.map((m) => m.tokenCount));
+  const top = matches.filter((m) => m.tokenCount === maxTokens);
+  if (top.length === 1) {
+    return { match: top[0].type, candidates: matches.map((m) => m.type), ambiguous: false };
+  }
+  return { match: null, candidates: top.map((m) => m.type), ambiguous: true };
+};
+
+// ─── Attachment → import units ────────────────────────────────────────────────
+// Normalizes both supported file kinds into the same shape: a list of
+// "units", each one importable slab of rows with the NAME that identifies
+// its object type. A plain CSV is ONE unit named by its filename (minus
+// extension); an XLSX workbook is one unit PER non-empty sheet, named by
+// the sheet. Everything downstream (parseCsvRows,
+// matchCsvHeadersToAttributes, the first-column-unique-key convention)
+// operates on the unit's csvText exactly as it always has for a bare CSV
+// — a sheet is just a CSV with a name attached.
+
+export const isImportableAttachment = (a) =>
+  /\.(csv|xlsx)$/i.test(a?.filename || '') ||
+  a?.mimeType === 'text/csv' ||
+  a?.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+export const extractImportUnits = (buffer, filename) => {
+  if (!/\.xlsx$/i.test(filename || '')) {
+    const base = String(filename || '').replace(/\.[^.]+$/, '');
+    return {
+      kind: 'csv',
+      units: [{ sheetName: null, nameSource: base, csvText: buffer.toString('utf8') }],
+    };
+  }
+  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const units = workbook.SheetNames
+    .map((sheetName) => ({
+      sheetName,
+      nameSource: sheetName,
+      csvText: XLSX.utils.sheet_to_csv(workbook.Sheets[sheetName]),
+    }))
+    .filter((u) => u.csvText.trim() !== '');
+  return { kind: 'xlsx', units };
 };
 
 // Parses CSV text into { headers, rows } — headers read explicitly via

@@ -45,7 +45,10 @@ Manifest modules → source paths:
 | `jira:adminPage` (configure, useAsConfig) | `src/frontend/ConfigurePage.jsx` |
 | `jira:adminPage` (get-started, useAsGetStarted) | `src/frontend/GetStartedPage.jsx` |
 | `jiraServiceManagement:portalFooter` | `src/frontend/index.jsx` |
+| `jira:issuePanel` (Import Assets from CSV) | `src/frontend/CsvImportPanel.jsx` |
+| `jira:workflowPostFunction` ×2 (analyze / approve import) | `src/importPostFunctions.js` → `src/resolvers/importPostFunctions.js` |
 | `function: resolver` (handler `index.handler`) | `src/index.js` → `src/resolvers/index.js` |
+| `consumer` ×3 (asset-load / csv-import / export queues) | `src/{assetLoadConsumer,csvImportConsumer,exportJobConsumer}.js` → `src/resolvers/…` |
 
 Static assets under `src/resources/` are imported by the frontend (e.g. `GetStartedPage.jsx` imports `config_*.png` walkthrough screenshots).
 
@@ -66,6 +69,7 @@ Static assets under `src/resources/` are imported by the frontend (e.g. `GetStar
 6. **Edit** — `updateAssetAttribute` re-verifies ownership via `verifyAssetOwnership` (always `asApp()`), then PUTs the attribute back to `/jsm/assets/workspace/{wsId}/v1/object/{objectId}`. `editMode === 'userAccount'` (legacy) writes as the user; default `serviceAccount` writes as the app and is the only mode that works for unlicensed portal customers.
 7. **Export** — `exportAssets` (client-supplied array) and `exportAssetsWithFilters` (server re-runs the ownership+filter AQL against `maxUserAssetLimit`) both delegate to `groupAssetsByType` + `buildXlsx` (via `xlsx`) or `buildPdf` (via `pdfkit`, A4 landscape) in `src/resolvers/exportAssets.js`, returning `base64` + `filename` + `mimeType` for the client to trigger a download.
 8. **Reconciliation** — `reconcileConfig` diffs the saved `hiddenByObjectType` against the live schema/types/attributes; `applyReconciliation` strips ghost IDs. Used by the admin page when the underlying schema has been edited in Jira.
+9. **CSV/XLSX import** — two paths into the same `csv-import-queue` consumer. *Manual*: the issue panel's original wizard (agent picks a CSV attachment + object type, previews, starts a job). *Automated* (`src/resolvers/importPostFunctions.js`): an "Analyze" workflow post-function (or the panel's Analyze button) builds a per-issue **plan** in KVS (`csv-import-plan:<issueId>`) — newest CSV/XLSX attachment split into units (one per CSV file / non-empty XLSX sheet), each unit's object type detected from its file/sheet **name** via `detectObjectTypeFromName` (token match, longest wins, ties/ambiguity never guessed) — and posts it as an issue comment; an "Approve" post-function (or the panel's Confirm) runs the plan. Units execute **sequentially, chained through the queue** (`advanceImportPlan` enqueues the next unit when one finishes) so workbook order holds — reference-target sheets import before sheets that reference them — and a per-sheet summary comment is posted at the end (that comment is why the `write:jira-work` scope exists). The first CSV column is always the unique key (upsert lookup); headers match attribute **names** case-insensitively.
 
 ### Frontend (`src/frontend/index.jsx`)
 
