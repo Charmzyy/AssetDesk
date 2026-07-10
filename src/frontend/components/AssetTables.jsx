@@ -15,8 +15,10 @@ import { PAGE_SIZE, assetKeyStyle } from './shared';
 
 // ─── Table components ─────────────────────────────────────────────────────────
 // AllAssetsTable (the "All" tab — mixed types, shared columns only) and
-// AssetTable (one per type tab — that type's full column set), plus the
-// shared LoadMoreRow control and the useJumpToLoadedPage pagination hook.
+// AssetTable (one per type tab — that type's columns, capped at
+// PRIMARY_COLUMN_LIMIT; the full set is in each row's Details modal), plus
+// the shared LoadMoreRow control and the useJumpToLoadedPage pagination
+// hook.
 
 // overflowX:auto here is defense-in-depth, not the primary mechanism —
 // forcing the table wider than its container (via an explicit pixel
@@ -31,6 +33,34 @@ import { PAGE_SIZE, assetKeyStyle } from './shared';
 // ask for more width than the container has — this property just catches
 // the rare case where something is still a few pixels over.
 const tableWrapStyle = xcss({ paddingTop: 'space.200', overflowX: 'auto', width: '100%' });
+
+// ─── PRIMARY_COLUMN_LIMIT ─────────────────────────────────────────────────────
+// Max ATTRIBUTE columns rendered in the grid (Name/Key/Type/actions are on
+// top of this). The footer's width is fixed by Jira's page layout (see the
+// tableWrapStyle comment above — we can't widen or horizontally scroll),
+// so every column added past this point just shaves readable width off all
+// the others; at ~13 columns cells were down to slivers with overlapping
+// headers. Columns past the cap aren't lost: every row's Details modal
+// (AssetDetailModal) shows the FULL attribute set stacked vertically, which
+// scales to any schema size. Order matters — the first N visible
+// attributes win a grid column, so the admin's attribute ordering in the
+// Configure page doubles as the "most important first" ranking.
+const PRIMARY_COLUMN_LIMIT = 5;
+
+const columnsNoteStyle = xcss({ paddingTop: 'space.100' });
+
+// Small subtle line above a table whose column set got capped — tells the
+// user the remaining fields didn't vanish, they're behind Details.
+const OverflowColumnsNote = ({ shown, total }) => {
+  if (total <= shown) return null;
+  return (
+    <Box xcss={columnsNoteStyle}>
+      <Text size="small" color="color.text.subtlest">
+        Showing {shown} of {total} fields as columns — open Details on a row to see all fields.
+      </Text>
+    </Box>
+  );
+};
 
 const loadMoreRowStyle = xcss({
   paddingTop: 'space.150',
@@ -135,13 +165,16 @@ const useJumpToLoadedPage = (isLoadingMore, loadedCount, rowsPerPage) => {
 
 // ─── AllAssetsTable ───────────────────────────────────────────────────────────
 
-export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canEdit, onEditClick, hasMore, isLoadingMore, onLoadMore, totalCount, isFiltered }) => {
+export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canEdit, onEditClick, onViewClick, hasMore, isLoadingMore, onLoadMore, totalCount, isFiltered }) => {
   const displayAssets = filteredAssets ?? assets;
   const [page, setPage] = useJumpToLoadedPage(isLoadingMore, displayAssets.length, PAGE_SIZE);
   const sharedCols = useMemo(
     () => getSharedColumns(assets, visibleAttributes),
     [assets, visibleAttributes]
   );
+  // Only the first N shared columns get grid space — the rest live in the
+  // per-row Details modal (see PRIMARY_COLUMN_LIMIT above).
+  const primaryCols = sharedCols.slice(0, PRIMARY_COLUMN_LIMIT);
 
   if (displayAssets.length === 0) {
     return (
@@ -156,12 +189,14 @@ export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canE
       { key: 'label', content: 'Name', isSortable: true, width: 22 },
       { key: 'objectKey', content: 'Key', isSortable: true, width: 8 },
       { key: 'type', content: 'Type', isSortable: true, width: 10 },
-      ...sharedCols.map((col) => ({
+      ...primaryCols.map((col) => ({
         key: `col-${col.attributeId}`,
         content: col.attributeName,
         isSortable: true,
       })),
-      ...(canEdit ? [{ key: 'actions', content: '', width: 6 }] : []),
+      // Actions column is unconditional now — Details is available to every
+      // caller (read-only), Edit joins it when the caller may edit.
+      { key: 'actions', content: '', width: canEdit ? 12 : 8 },
     ],
   };
 
@@ -181,20 +216,25 @@ export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canE
         key: `type-${i}`,
         content: <Lozenge appearance="inprogress">{asset.objectTypeName || '—'}</Lozenge>,
       },
-      ...sharedCols.map((col) => ({
+      ...primaryCols.map((col) => ({
         key: `col-${col.attributeId}-${i}`,
         content: <Text>{asset.visibleValues?.[col.attributeId] || '—'}</Text>,
       })),
-      ...(canEdit ? [
-        {
-          key: `edit-${i}`,
-          content: (
-            <Button appearance="subtle" spacing="compact" onClick={() => onEditClick(asset)}>
-              Edit
+      {
+        key: `actions-${i}`,
+        content: (
+          <Inline space="space.050" alignBlock="center">
+            <Button appearance="subtle" spacing="compact" onClick={() => onViewClick(asset)}>
+              Details
             </Button>
-          ),
-        },
-      ] : []),
+            {canEdit && (
+              <Button appearance="subtle" spacing="compact" onClick={() => onEditClick(asset)}>
+                Edit
+              </Button>
+            )}
+          </Inline>
+        ),
+      },
     ],
   }));
 
@@ -202,6 +242,7 @@ export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canE
 
   return (
     <Box xcss={tableWrapStyle}>
+      <OverflowColumnsNote shown={primaryCols.length} total={sharedCols.length} />
       <DynamicTable
         head={head}
         rows={rows}
@@ -232,11 +273,14 @@ export const AllAssetsTable = ({ assets, filteredAssets, visibleAttributes, canE
 
 // ─── AssetTable ───────────────────────────────────────────────────────────────
 
-export const AssetTable = ({ assets, filteredAssets, columns, canEdit, onEditClick, hasMore, isLoadingMore, onLoadMore, totalCount, isFiltered }) => {
+export const AssetTable = ({ assets, filteredAssets, columns, canEdit, onEditClick, onViewClick, hasMore, isLoadingMore, onLoadMore, totalCount, isFiltered }) => {
   const displayAssets = filteredAssets ?? assets;
   // Called unconditionally, ahead of the early return below — hooks can't
   // follow a conditional return.
   const [page, setPage] = useJumpToLoadedPage(isLoadingMore, displayAssets.length, PAGE_SIZE);
+  // Only the first N columns get grid space — the rest live in the per-row
+  // Details modal (see PRIMARY_COLUMN_LIMIT above).
+  const primaryCols = columns.slice(0, PRIMARY_COLUMN_LIMIT);
 
   if (displayAssets.length === 0) {
     return (
@@ -250,12 +294,14 @@ export const AssetTable = ({ assets, filteredAssets, columns, canEdit, onEditCli
     cells: [
       { key: 'label', content: 'Name', isSortable: true, width: 20 },
       { key: 'objectKey', content: 'Key', isSortable: true, width: 10 },
-      ...columns.map((col) => ({
+      ...primaryCols.map((col) => ({
         key: `col-${col.attributeId}`,
         content: col.attributeName,
         isSortable: true,
       })),
-      ...(canEdit ? [{ key: 'actions', content: '', width: 8 }] : []),
+      // Actions column is unconditional now — Details is available to every
+      // caller (read-only), Edit joins it when the caller may edit.
+      { key: 'actions', content: '', width: canEdit ? 14 : 8 },
     ],
   };
 
@@ -271,20 +317,25 @@ export const AssetTable = ({ assets, filteredAssets, columns, canEdit, onEditCli
           </Box>
         ),
       },
-      ...columns.map((col) => ({
+      ...primaryCols.map((col) => ({
         key: `col-${col.attributeId}-${i}`,
         content: <Text>{asset.visibleValues?.[col.attributeId] || '—'}</Text>,
       })),
-      ...(canEdit ? [
-        {
-          key: `edit-${i}`,
-          content: (
-            <Button appearance="subtle" spacing="compact" onClick={() => onEditClick(asset)}>
-              Edit
+      {
+        key: `actions-${i}`,
+        content: (
+          <Inline space="space.050" alignBlock="center">
+            <Button appearance="subtle" spacing="compact" onClick={() => onViewClick(asset)}>
+              Details
             </Button>
-          ),
-        },
-      ] : []),
+            {canEdit && (
+              <Button appearance="subtle" spacing="compact" onClick={() => onEditClick(asset)}>
+                Edit
+              </Button>
+            )}
+          </Inline>
+        ),
+      },
     ],
   }));
 
@@ -292,6 +343,7 @@ export const AssetTable = ({ assets, filteredAssets, columns, canEdit, onEditCli
 
   return (
     <Box xcss={tableWrapStyle}>
+      <OverflowColumnsNote shown={primaryCols.length} total={columns.length} />
       <DynamicTable
         head={head}
         rows={rows}

@@ -23,6 +23,7 @@ import {
   useFilteredAssets,
 } from './components/shared';
 import EditAssetModal from './components/EditAssetModal';
+import AssetDetailModal from './components/AssetDetailModal';
 import ExportButtons from './components/ExportButtons';
 import FilterBar from './components/FilterBar';
 import { AllAssetsTable, AssetTable, LoadMoreRow } from './components/AssetTables';
@@ -69,6 +70,12 @@ const App = () => {
   const [error, setError] = useState(null);
   const [editingAsset, setEditingAsset] = useState(null);
   const [editColumns, setEditColumns] = useState([]);
+  // Read-only Details modal — the tables cap how many attribute columns
+  // they render (PRIMARY_COLUMN_LIMIT in AssetTables.jsx), so this is
+  // where a user sees an asset's FULL attribute set. Same
+  // asset+columns-for-its-type pattern as the edit modal above.
+  const [viewingAsset, setViewingAsset] = useState(null);
+  const [viewColumns, setViewColumns] = useState([]);
   const [diagnosis, setDiagnosis] = useState(null);
   const [isUnlicensed, setIsUnlicensed] = useState(false);
 
@@ -663,6 +670,30 @@ const App = () => {
     setEditColumns([]);
   }, []);
 
+  const handleViewClick = useCallback(
+    (asset) => {
+      const typeId = String(asset.objectTypeId || '');
+      const cols = getColumnsForType(visibleAttributes, typeId);
+      setViewColumns(cols);
+      setViewingAsset(asset);
+    },
+    [visibleAttributes]
+  );
+
+  const handleViewClose = useCallback(() => {
+    setViewingAsset(null);
+    setViewColumns([]);
+  }, []);
+
+  // "Edit asset" inside the Details modal — hand the SAME asset+columns
+  // over to the edit modal so it feels like switching modes, not
+  // re-opening from scratch.
+  const handleViewToEdit = useCallback(() => {
+    setViewingAsset(null);
+    setEditColumns(viewColumns);
+    setEditingAsset(viewingAsset);
+  }, [viewingAsset, viewColumns]);
+
   // Group currently-loaded assets by objectTypeId (not name — IDs are the
   // authoritative key typeCatalog uses, and two types could theoretically
   // share a display name).
@@ -1028,6 +1059,7 @@ const App = () => {
                       visibleAttributes={visibleAttributes}
                       canEdit={canEditAssets}
                       onEditClick={handleEditClick}
+                      onViewClick={handleViewClick}
                       hasMore={allPagination.hasMore}
                       isLoadingMore={loadingMoreTypeId === 'all'}
                       onLoadMore={() => handleLoadMore(null)}
@@ -1081,6 +1113,7 @@ const App = () => {
                         columns={typeCols}
                         canEdit={canEditAssets}
                         onEditClick={handleEditClick}
+                        onViewClick={handleViewClick}
                         hasMore={Boolean(typePagination?.hasMore)}
                         isLoadingMore={loadingMoreTypeId === typeId}
                         onLoadMore={() => handleLoadMore(typeId)}
@@ -1110,6 +1143,7 @@ const App = () => {
                       }
                       canEdit={canEditAssets}
                       onEditClick={handleEditClick}
+                      onViewClick={handleViewClick}
                       hasMore={Boolean(pagination?.hasMore)}
                       isLoadingMore={Boolean(loadingMoreTypeId)}
                       onLoadMore={() => handleLoadMore(onlyTypeId)}
@@ -1133,6 +1167,18 @@ const App = () => {
             columns={editColumns}
             onClose={handleModalClose}
             onSaved={handleAssetSaved}
+          />
+        )}
+      </ModalTransition>
+
+      <ModalTransition>
+        {viewingAsset && (
+          <AssetDetailModal
+            asset={viewingAsset}
+            columns={viewColumns}
+            canEdit={canEditAssets}
+            onEdit={handleViewToEdit}
+            onClose={handleViewClose}
           />
         )}
       </ModalTransition>
