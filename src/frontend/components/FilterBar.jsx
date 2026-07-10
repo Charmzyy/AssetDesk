@@ -238,7 +238,7 @@ const FilterBar = ({
         )}
         {filterMode === 'aql' && !trimmedAql && (
           <Text size="small" color="color.text.subtlest">
-            Type a raw AQL condition — it only ever narrows within your own assets. Quote attribute
+            Type a raw AQL condition . Quote attribute
             names and values (e.g. "Asset Status" = "In Stock"); AND / OR / like are supported.
           </Text>
         )}
