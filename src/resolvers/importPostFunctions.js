@@ -449,7 +449,7 @@ const tryAttachTemplate = async (issueId) => {
       status === 'attached' ? 'Template ' : 'See the attached template ',
       fileRef,
       status === 'attached' ? ' attached' : '',
-      ' — fill it in (see its README sheet), save it under a new file name, attach it here, and re-run Analyze.',
+      ' — fill it in (go through  the README sheet), save it under a new file name and attach it here.',
     ].filter((seg) => seg !== '');
   } catch (err) {
     console.warn(`[tryAttachTemplate] ${issueId} failed:`, err?.message || err);
