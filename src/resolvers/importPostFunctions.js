@@ -14,7 +14,9 @@ import {
   detectObjectTypeFromName,
   extractImportUnits,
   isImportableAttachment,
+  IMPORT_TEMPLATE_FILENAME,
 } from './shared';
+import { attachImportTemplateToIssue } from './importTemplate';
 
 // ─── Automated CSV/XLSX import via workflow post-functions ─────────────────────
 // Two post-functions the admin places on transitions of an import request
@@ -56,6 +58,21 @@ const HEADERS_CAP = 50;
 const UNMATCHED_CAP = 30;
 const CANDIDATES_CAP = 10;
 
+// How many per-row errors/warnings each unit's result keeps in the PLAN
+// (and therefore in the comment + panel). The job record itself keeps up
+// to 200 of each (csvImportConsumer.js) — but the plan holds every
+// unit's result in ONE KVS value, so a 10-sheet workbook at 200 errors a
+// sheet would blow the 128 KB cap. Small caps here; the comment points
+// at the panel/job record for the rest.
+const PLAN_RESULT_ERRORS_CAP = 10;
+const PLAN_RESULT_WARNINGS_CAP = 5;
+
+// How many unmatched-column NAMES the plan comment spells out per unit —
+// beyond this it's "+N more", and the true total comes from
+// totalColumns - matchedColumns (unmatchedColumns itself is capped at
+// UNMATCHED_CAP, so its length can undercount).
+const COMMENT_UNMATCHED_CAP = 8;
+
 const getIssueId = (event) => {
   const id = event?.issue?.id || event?.issue?.key || event?.context?.issue?.id;
   return id != null ? String(id) : null;
@@ -74,11 +91,22 @@ const newPendingJobRecord = () => ({
 // the panel. Comment failures are logged but never fail the operation
 // they're reporting on.
 
-const adfParagraph = (text) => ({ type: 'paragraph', content: [{ type: 'text', text }] });
+// A paragraph is a string, or an array of segments for mixed text/links —
+// a segment is a string or { text, href } (rendered as an inline link,
+// used to link the attached template file right in the comment).
+const adfTextSegment = (seg) =>
+  typeof seg === 'string'
+    ? { type: 'text', text: seg }
+    : { type: 'text', text: seg.text, marks: [{ type: 'link', attrs: { href: seg.href } }] };
+
+const adfParagraph = (segments) => ({
+  type: 'paragraph',
+  content: (Array.isArray(segments) ? segments : [segments]).map(adfTextSegment),
+});
 
 export const postIssueComment = async (issueId, blocks) => {
   const content = blocks.map((b) =>
-    typeof b === 'string'
+    typeof b === 'string' || Array.isArray(b)
       ? adfParagraph(b)
       : {
           type: 'bulletList',
@@ -106,15 +134,23 @@ const unitPlanLine = (plan, unit) => {
   const label = unitLabel(plan, unit);
   if (unit.objectTypeId && unit.uniqueKeyOk) {
     let line =
-      `${label} -> ${unit.objectTypeName} (matched by ${unit.matchedBy === 'manual' ? 'manual choice' : 'name'}) — ` +
-      `${unit.totalRows} row(s), ${unit.matchedColumns}/${unit.totalColumns} column(s) matched, ` +
-      `key column "${unit.uniqueKeyHeader}" OK`;
+      `${label} -> ${unit.objectTypeName}${unit.matchedBy === 'manual' ? ' (manual)' : ''} — ` +
+      `${unit.totalRows} row(s), ${unit.matchedColumns}/${unit.totalColumns} columns matched, key "${unit.uniqueKeyHeader}" OK`;
+    // Name the columns that WON'T import, not just the count — "8/11
+    // matched" leaves the user diffing headers against the schema by
+    // hand; naming the three losers tells them exactly what to rename.
+    const unmatchedTotal = unit.totalColumns - unit.matchedColumns;
+    if (unmatchedTotal > 0 && unit.unmatchedColumns?.length > 0) {
+      const shown = unit.unmatchedColumns.slice(0, COMMENT_UNMATCHED_CAP);
+      const more = unmatchedTotal - shown.length;
+      line += `. Ignored columns: ${shown.map((h) => `"${h}"`).join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
+    }
     if (unit.isParentType) {
-      line += `. NOTE: ${unit.objectTypeName} is a PARENT type — if the objects belong in one of its child types, change it in the AssetDesk import panel before approving`;
+      line += `. NOTE: ${unit.objectTypeName} is a PARENT type — if these belong in a child type, change it in the import panel first`;
     }
     return line;
   }
-  return `${label} -> SKIPPED: ${unit.reason || 'no object type resolved'}`;
+  return `${label} -> skipped: ${unit.reason || 'no object type resolved'}`;
 };
 
 // ─── Plan building (the "analyze" half) ────────────────────────────────────────
@@ -135,11 +171,18 @@ export const buildImportPlanForIssue = async (issueId, { analyzedBy = 'postfunct
   const allAttachments = (await issueRes.json()).fields?.attachment || [];
   // Newest importable attachment only — analyzing several at once confuses
   // more than it helps; re-attaching and re-analyzing is the workflow.
+  // The generated template is excluded by its fixed filename: it's a valid
+  // XLSX this app may itself have attached (see analyzeHandler), and it
+  // must never win the "newest" pick over the user's actual data file.
   const attachment = allAttachments
     .filter(isImportableAttachment)
+    .filter((a) => (a.filename || '').toLowerCase() !== IMPORT_TEMPLATE_FILENAME.toLowerCase())
     .sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0))[0];
   if (!attachment) {
-    return { error: 'No CSV or XLSX attachment found on this ticket.' };
+    // errorCode lets analyzeHandler react to THIS failure specifically
+    // (attach a template showing what to upload) without string-matching
+    // the human-readable message.
+    return { error: 'No CSV or XLSX attachment found on this ticket.', errorCode: 'no-attachment' };
   }
 
   const contentRes = await api.asApp().requestJira(route`/rest/api/3/attachment/content/${attachment.id}`);
@@ -200,8 +243,8 @@ export const buildImportPlanForIssue = async (issueId, { analyzedBy = 'postfunct
     if (!detection.match) {
       unit.candidates = detection.candidates.slice(0, CANDIDATES_CAP).map((t) => ({ id: t.id, name: t.name }));
       unit.reason = detection.ambiguous
-        ? `Name "${raw.nameSource}" matches more than one object type (${unit.candidates.map((c) => c.name).join(', ')}) — pick one in the AssetDesk import panel.`
-        : `No object type name found in "${raw.nameSource}" — rename the ${raw.sheetName ? 'sheet' : 'file'} to include one, or pick a type in the AssetDesk import panel.`;
+        ? `"${raw.nameSource}" matches several object types (${unit.candidates.map((c) => c.name).join(', ')}) — pick one in the import panel.`
+        : `No object type matches "${raw.nameSource}" — rename the ${raw.sheetName ? 'sheet' : 'file'} after a type, or pick one in the import panel.`;
       continue;
     }
 
@@ -209,7 +252,7 @@ export const buildImportPlanForIssue = async (issueId, { analyzedBy = 'postfunct
     if (type.abstract) {
       const children = objectTypes.filter((t) => t.parentObjectTypeId === type.id);
       unit.candidates = children.slice(0, CANDIDATES_CAP).map((t) => ({ id: t.id, name: t.name }));
-      unit.reason = `"${type.name}" is an abstract object type and can't hold objects — pick one of its child types${children.length ? ` (${children.map((c) => c.name).join(', ')})` : ''} in the AssetDesk import panel.`;
+      unit.reason = `"${type.name}" is abstract and can't hold objects — pick one of its child types${children.length ? ` (${children.map((c) => c.name).join(', ')})` : ''} in the import panel.`;
       continue;
     }
 
@@ -316,7 +359,21 @@ export const advanceImportPlan = async ({ issueId, unitIndex, outcome }) => {
     return;
   }
   const unit = plan.units.find((u) => u.index === unitIndex);
-  if (unit) unit.result = outcome || {};
+  if (unit) {
+    // The outcome's errors/warnings arrive uncapped-in-memory (up to the
+    // job record's 200 each) — cap them before they're persisted into the
+    // plan, which holds EVERY unit's result in one KVS value (see
+    // PLAN_RESULT_*_CAP above). warningsTotal is kept because, unlike
+    // failures (summary.failed), nothing else records how many there were.
+    const allWarnings = outcome?.warnings || [];
+    unit.result = {
+      summary: outcome?.summary,
+      error: outcome?.error,
+      errors: (outcome?.errors || []).slice(0, PLAN_RESULT_ERRORS_CAP),
+      warnings: allWarnings.slice(0, PLAN_RESULT_WARNINGS_CAP),
+      warningsTotal: allWarnings.length,
+    };
+  }
 
   const next = plan.units.find((u) => u.index > unitIndex && isRunnableUnit(u));
   if (next) {
@@ -337,13 +394,68 @@ export const advanceImportPlan = async ({ issueId, unitIndex, outcome }) => {
     const s = u.result.summary || {};
     return `${label} -> ${u.objectTypeName}: ${s.created || 0} created, ${s.updated || 0} updated, ${s.unchanged || 0} unchanged, ${s.failed || 0} failed`;
   });
-  await postIssueComment(issueId, [
+  const blocks = [
     `AssetDesk import finished for "${plan.filename}":`,
     { bullets: lines },
-  ]);
+  ];
+
+  // Per-row detail under the counts — the comment is this flow's only
+  // feedback channel, and "2 failed" with no row/reason forces the user
+  // to open the panel just to find out what to fix. Capped per unit (see
+  // PLAN_RESULT_*_CAP); anything beyond the caps points at the panel.
+  let anyOverflow = false;
+  plan.units.forEach((u) => {
+    if (!u.result) return;
+    const label = unitLabel(plan, u);
+    const failedTotal = u.result.summary?.failed || 0;
+    const errs = u.result.errors || [];
+    if (errs.length > 0) {
+      blocks.push(`${label} — failed rows${failedTotal > errs.length ? ` (first ${errs.length} of ${failedTotal})` : ''}:`);
+      blocks.push({ bullets: errs.map((e) => `Row ${e.row}${e.keyValue ? ` (${e.keyValue})` : ''}: ${e.message}`) });
+      if (failedTotal > errs.length) anyOverflow = true;
+    }
+    const warns = u.result.warnings || [];
+    const warningsTotal = u.result.warningsTotal || warns.length;
+    if (warns.length > 0) {
+      blocks.push(`${label} — imported with warnings${warningsTotal > warns.length ? ` (first ${warns.length} of ${warningsTotal})` : ''}:`);
+      blocks.push({ bullets: warns.map((w) => `Row ${w.row}: ${w.message}`) });
+      if (warningsTotal > warns.length) anyOverflow = true;
+    }
+  });
+  if (anyOverflow) {
+    blocks.push('Open the "Import Assets from CSV" panel on this ticket for the full list.');
+  }
+  await postIssueComment(issueId, blocks);
 };
 
 // ─── The post-function handlers themselves (see manifest.yml) ──────────────────
+
+// Attaches the generated import template to the issue and returns the
+// comment paragraph describing it — a segment array so the filename is a
+// clickable download link (see adfTextSegment) — or null when there's
+// nothing to say (no schema configured, or the upload failed).
+// Best-effort by design: the analysis result must post whether or not
+// this works. The structure explanation itself lives on the template's
+// README sheet, so the comment stays to one line.
+const tryAttachTemplate = async (issueId) => {
+  try {
+    const config = (await kvs.get(CONFIG_KEY)) || {};
+    if (!config.schemaId) return null;
+    const workspaceId = await getWorkspaceId(true);
+    const { status, url } = await attachImportTemplateToIssue(issueId, workspaceId, config.schemaId);
+    if (status === 'failed') return null;
+    const fileRef = url ? { text: IMPORT_TEMPLATE_FILENAME, href: url } : `"${IMPORT_TEMPLATE_FILENAME}"`;
+    return [
+      status === 'attached' ? 'Template ' : 'See the attached template ',
+      fileRef,
+      status === 'attached' ? ' attached' : '',
+      ' — fill it in (see its README sheet), save it under a new file name, attach it here, and re-run Analyze.',
+    ].filter((seg) => seg !== '');
+  } catch (err) {
+    console.warn(`[tryAttachTemplate] ${issueId} failed:`, err?.message || err);
+    return null;
+  }
+};
 
 export const analyzeHandler = async (event) => {
   const issueId = getIssueId(event);
@@ -352,17 +464,39 @@ export const analyzeHandler = async (event) => {
     return;
   }
   try {
-    const { plan, error } = await buildImportPlanForIssue(issueId, { analyzedBy: 'postfunction' });
+    const { plan, error, errorCode } = await buildImportPlanForIssue(issueId, { analyzedBy: 'postfunction' });
     if (error) {
-      await postIssueComment(issueId, [`AssetDesk import: ${error}`]);
+      const blocks = [`AssetDesk import: ${error}`];
+      // No file at all is the same knowledge gap as a wrongly-named one —
+      // give the user the template that shows what to upload.
+      if (errorCode === 'no-attachment') {
+        const templateNote = await tryAttachTemplate(issueId);
+        if (templateNote) blocks.push(templateNote);
+      }
+      await postIssueComment(issueId, blocks);
       return;
     }
     const runnable = plan.units.filter(isRunnableUnit).length;
-    await postIssueComment(issueId, [
+    const blocks = [
       `AssetDesk import plan for "${plan.filename}" — ${runnable} of ${plan.units.length} ${plan.kind === 'xlsx' ? 'sheet(s)' : 'file(s)'} ready to import:`,
       { bullets: plan.units.map((u) => unitPlanLine(plan, u)) },
-      'To run it, execute the transition that has the "AssetDesk — Run approved asset import" post-function, or open the "Import Assets from CSV" panel on this ticket to adjust and confirm. Nothing has been imported yet.',
-    ]);
+    ];
+    // Any unit without a resolved object type means the file/sheet naming
+    // didn't line up with the schema — exactly the situation the template
+    // exists to demonstrate. (Units that resolved but failed the key
+    // check get column-level guidance in their plan line instead.)
+    if (plan.units.some((u) => !u.objectTypeId)) {
+      const templateNote = await tryAttachTemplate(issueId);
+      if (templateNote) blocks.push(templateNote);
+    }
+    // The how-to-run line only earns its place when there's something to
+    // run; a 0-ready plan ends on the fix-it guidance instead.
+    blocks.push(
+      runnable > 0
+        ? 'To import: run the approve transition, or confirm in the "Import Assets from CSV" panel on this ticket. Nothing has been imported yet.'
+        : 'Nothing has been imported yet.'
+    );
+    await postIssueComment(issueId, blocks);
   } catch (err) {
     console.error('[analyzeHandler] failed:', err);
     await postIssueComment(issueId, [`AssetDesk import analysis failed: ${err?.message || 'unexpected error'}`]);

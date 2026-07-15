@@ -40,6 +40,18 @@ const summaryBoxStyle = xcss({
 const POLL_INTERVAL_MS = 1000;
 const PLAN_POLL_INTERVAL_MS = 1500;
 
+// Same data-URI download trick ExportButtons uses for XLSX/PDF exports —
+// the resolver hands back base64 + filename + mimeType and the browser
+// does the rest.
+const triggerBase64Download = (base64, filename, mimeType) => {
+  const link = document.createElement('a');
+  link.href = `data:${mimeType};base64,${base64}`;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+};
+
 const App = () => {
   const [issueId, setIssueId] = useState(null);
   const [schemaId, setSchemaId] = useState(null);
@@ -83,6 +95,7 @@ const App = () => {
   const [planBusy, setPlanBusy] = useState(false);       // analyze in flight
   const [planStarting, setPlanStarting] = useState(false); // confirm in flight
   const [planCreateOnly, setPlanCreateOnly] = useState(false);
+  const [templateBusy, setTemplateBusy] = useState(false); // template download in flight
   const planPollTokenRef = useRef(0);
 
   const pollPlan = useCallback(async (currentIssueId, token) => {
@@ -234,6 +247,27 @@ const App = () => {
     }
   }, [issueId, objectTypes]);
 
+  // Downloads the generated import template (one headers-only sheet per
+  // object type, README with instructions — see resolvers/importTemplate.js)
+  // so the agent can hand users a file whose sheet names and headers are
+  // guaranteed to pass the analyze step.
+  const handleDownloadTemplate = useCallback(async () => {
+    setTemplateBusy(true);
+    setPlanError(null);
+    try {
+      const result = await invoke('generateImportTemplate', { issueId });
+      if (result.error) {
+        setPlanError(result.error);
+        return;
+      }
+      triggerBase64Download(result.base64, result.filename, result.mimeType);
+    } catch (err) {
+      setPlanError(err?.message || 'Failed to generate the import template.');
+    } finally {
+      setTemplateBusy(false);
+    }
+  }, [issueId]);
+
   const handleConfirmPlan = useCallback(async () => {
     setPlanStarting(true);
     setPlanError(null);
@@ -301,9 +335,12 @@ const App = () => {
           )}
 
           {!plan && (
-            <Inline>
+            <Inline space="space.100">
               <Button onClick={handleAnalyzePlan} isLoading={planBusy} isDisabled={planBusy}>
                 Analyze newest attachment
+              </Button>
+              <Button onClick={handleDownloadTemplate} isLoading={templateBusy} isDisabled={templateBusy}>
+                Download template
               </Button>
             </Inline>
           )}
@@ -353,6 +390,15 @@ const App = () => {
                       </Text>
                     )}
 
+                    {/* Name the columns that won't import — the count above
+                        says how many, this says which, so the user knows
+                        exactly what to rename in the file. */}
+                    {unit.objectTypeId && unit.unmatchedColumns?.length > 0 && (
+                      <Text size="small" color="color.text.subtlest">
+                        Ignored columns (no attribute with that name): {unit.unmatchedColumns.join(', ')}
+                      </Text>
+                    )}
+
                     {unit.isParentType && (
                       <Text size="small" color="color.text.warning">
                         {unit.objectTypeName} is a parent type — if these objects belong in one of its child types, pick the child above before importing.
@@ -367,10 +413,40 @@ const App = () => {
                       unit.result.error ? (
                         <Text size="small" color="color.text.danger">Failed: {unit.result.error}</Text>
                       ) : (
-                        <Text size="small">
-                          Done — {unit.result.summary?.created || 0} created, {unit.result.summary?.updated || 0} updated,
-                          {' '}{unit.result.summary?.unchanged || 0} unchanged, {unit.result.summary?.failed || 0} failed
-                        </Text>
+                        <Stack space="space.025">
+                          <Text size="small">
+                            Done — {unit.result.summary?.created || 0} created, {unit.result.summary?.updated || 0} updated,
+                            {' '}{unit.result.summary?.unchanged || 0} unchanged, {unit.result.summary?.failed || 0} failed
+                          </Text>
+                          {/* Per-row detail — the plan keeps a capped slice of
+                              each unit's errors/warnings (see
+                              advanceImportPlan in importPostFunctions.js);
+                              the summary comment shows the same slice. */}
+                          {unit.result.errors?.length > 0 && (
+                            <>
+                              <Text size="small" color="color.text.subtlest">
+                                Failed rows{(unit.result.summary?.failed || 0) > unit.result.errors.length ? ` (first ${unit.result.errors.length} of ${unit.result.summary.failed})` : ''}:
+                              </Text>
+                              {unit.result.errors.map((e, i) => (
+                                <Text key={i} size="small" color="color.text.danger">
+                                  Row {e.row}{e.keyValue ? ` (${e.keyValue})` : ''}: {e.message}
+                                </Text>
+                              ))}
+                            </>
+                          )}
+                          {unit.result.warnings?.length > 0 && (
+                            <>
+                              <Text size="small" color="color.text.subtlest">
+                                Imported with warnings{(unit.result.warningsTotal || 0) > unit.result.warnings.length ? ` (first ${unit.result.warnings.length} of ${unit.result.warningsTotal})` : ''} — usually a reference value that didn't match an existing object:
+                              </Text>
+                              {unit.result.warnings.map((w, i) => (
+                                <Text key={i} size="small" color="color.text.warning">
+                                  Row {w.row}: {w.message}
+                                </Text>
+                              ))}
+                            </>
+                          )}
+                        </Stack>
                       )
                     )}
                   </Stack>
@@ -400,6 +476,9 @@ const App = () => {
                 </Button>
                 <Button onClick={handleAnalyzePlan} isDisabled={planBusy || planImporting || planStarting} isLoading={planBusy}>
                   Re-analyze
+                </Button>
+                <Button onClick={handleDownloadTemplate} isLoading={templateBusy} isDisabled={templateBusy || planImporting}>
+                  Download template
                 </Button>
               </Inline>
             </Stack>

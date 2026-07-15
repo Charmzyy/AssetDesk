@@ -11,8 +11,10 @@ import {
   parseCsvRows,
   matchCsvHeadersToAttributes,
   isUnlicensedCaller,
+  IMPORT_TEMPLATE_FILENAME,
 } from './shared';
 import { buildImportPlanForIssue, startImportPlanJobs } from './importPostFunctions';
+import { buildImportTemplateWorkbook, XLSX_MIME_TYPE } from './importTemplate';
 
 // ─── CSV ticket-attachment asset import ────────────────────────────────────────
 // Lets an agent attach a CSV to a ticket, pick which attachment + which
@@ -213,6 +215,36 @@ export const registerCsvImportResolvers = (resolver) => {
     } catch (err) {
       console.error('[overrideImportPlanUnit] error:', err);
       return { error: err?.message || 'Failed to apply the override' };
+    }
+  });
+
+  // On-demand template download for the panel's "Download template"
+  // button — same workbook the analyze post-function auto-attaches when
+  // sheets can't be matched (importTemplate.js), but returned to the
+  // browser as base64 for a client-side download, the export-resolver
+  // pattern. Headers-only sheets keep it a few KB, so no async job is
+  // needed. asUser: the agent's own read access to the schema/types is
+  // exactly the right permission boundary here.
+  resolver.define('generateImportTemplate', async ({ payload, context }) => {
+    const issueId = payload?.issueId != null ? String(payload.issueId) : null;
+    const accessError = await importPlanAccessError(issueId, context);
+    if (accessError) return { error: accessError };
+    try {
+      const config = (await kvs.get(CONFIG_KEY)) || {};
+      if (!config.schemaId) return { error: 'No Assets schema configured.' };
+      const workspaceId = await getWorkspaceId(false);
+      const { buffer, sheetCount } = await buildImportTemplateWorkbook(api.asUser(), workspaceId, config.schemaId);
+      if (sheetCount === 0) {
+        return { error: 'The configured schema has no importable object types.' };
+      }
+      return {
+        base64: buffer.toString('base64'),
+        filename: IMPORT_TEMPLATE_FILENAME,
+        mimeType: XLSX_MIME_TYPE,
+      };
+    } catch (err) {
+      console.error('[generateImportTemplate] error:', err);
+      return { error: err?.message || 'Failed to generate the import template' };
     }
   });
 

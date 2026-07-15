@@ -158,10 +158,14 @@ export const handler = async (event) => {
     await kvs.set(csvImportJobKey(jobId), record);
     if (!planRef) return;
     try {
+      // errors/warnings ride along uncapped (well, at the job record's own
+      // 200-each cap) — advanceImportPlan trims them to its own much
+      // smaller caps before persisting them into the plan and the summary
+      // comment.
       await advanceImportPlan({
         issueId: planRef.issueId,
         unitIndex: planRef.unitIndex,
-        outcome: { summary: record.summary, error: record.error },
+        outcome: { summary: record.summary, error: record.error, errors: record.errors, warnings: record.warnings },
       });
     } catch (err) {
       console.error(`[csvImportConsumer] jobId=${jobId} failed to advance the import plan:`, err);

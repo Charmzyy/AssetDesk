@@ -635,6 +635,10 @@ export const fetchObjectTypeAttributeDefs = async (caller, workspaceId, objectTy
           attributeName: def.name || '',
           attributeType,
           isEditable: def.editable !== false,
+          // The type's label attribute (usually "Name") — the import
+          // template generator puts it first so it lands in the CSV's
+          // unique-key position (first column, by convention).
+          isLabel: Boolean(def.label),
           referenceObjectTypeId: attributeType === 'object' ? String(def.referenceObjectTypeId || '') : '',
         };
       })
@@ -739,6 +743,14 @@ export const isImportableAttachment = (a) =>
   a?.mimeType === 'text/csv' ||
   a?.mimeType === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
+// The generated import template's fixed filename (see importTemplate.js).
+// buildImportPlanForIssue excludes attachments with this exact name when
+// picking the newest importable attachment — the template is itself a
+// valid XLSX, so without the exclusion, attaching one would hijack the
+// next analyze run. The template's README tells users to save their
+// filled-in copy under a different name.
+export const IMPORT_TEMPLATE_FILENAME = 'AssetDesk-import-template.xlsx';
+
 export const extractImportUnits = (buffer, filename) => {
   if (!/\.xlsx$/i.test(filename || '')) {
     const base = String(filename || '').replace(/\.[^.]+$/, '');
@@ -749,6 +761,12 @@ export const extractImportUnits = (buffer, filename) => {
   }
   const workbook = XLSX.read(buffer, { type: 'buffer' });
   const units = workbook.SheetNames
+    // A sheet named README is documentation by convention, never data —
+    // the generated import template ships one with instructions, and a
+    // filled-in copy of the template keeps it. Excluding it here (rather
+    // than letting it surface as a "no object type found" skipped unit)
+    // keeps the plan comment free of noise the user can't act on.
+    .filter((sheetName) => !/^readme$/i.test(sheetName.trim()))
     .map((sheetName) => ({
       sheetName,
       nameSource: sheetName,
